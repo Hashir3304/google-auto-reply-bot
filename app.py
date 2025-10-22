@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from threading import Thread
 import requests
 import openai
-from flask import Flask
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
@@ -20,6 +20,7 @@ NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO", GMAIL_USER)
 
 # === Configure OpenAI (stable version) ===
 openai.api_key = OPENAI_KEY
+
 
 # === Gmail Helper ===
 def send_email(subject, body):
@@ -35,10 +36,19 @@ def send_email(subject, body):
     except Exception as e:
         print(f"❌ Email send failed: {e}")
 
+
 # === Health Check Route ===
 @app.route("/")
 def home():
-    return "✅ Pawsy Prints Auto-Reply Bot — running hourly with Gmail summaries."
+    return "✅ Pawsy Prints Auto-Reply Bot is live — runs hourly and on-demand via /run-now."
+
+
+# === Manual Trigger Route ===
+@app.route("/run-now", methods=["GET"])
+def run_now():
+    Thread(target=auto_reply_once).start()
+    return jsonify({"status": "started", "message": "Auto-reply process triggered manually."})
+
 
 # === Fetch Google Reviews ===
 def get_reviews():
@@ -51,18 +61,19 @@ def get_reviews():
         return []
     return r.json().get("reviews", [])
 
+
 # === Generate AI Reply ===
 def generate_reply(name, stars, text):
     prompt = (
         f"{name} left a {stars}-star Google review:\n"
         f"\"{text}\"\n\n"
-        "Write a warm, kind, professional thank-you reply from Pawsy Prints under 60 words."
+        "Write a warm, kind, and professional thank-you reply from Pawsy Prints under 60 words."
     )
     try:
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are Pawsy Prints’ friendly support assistant."},
+                {"role": "system", "content": "You are Pawsy Prints’ friendly assistant for public customer replies."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
@@ -72,6 +83,7 @@ def generate_reply(name, stars, text):
         print(f"❌ OpenAI error: {e}")
         send_email("❌ GPT Error", str(e))
         return ""
+
 
 # === Post Reply to Google ===
 def post_reply(review_id, reply):
@@ -89,6 +101,7 @@ def post_reply(review_id, reply):
         send_email("❌ Post Reply Failed", f"Review ID: {review_id}\n\n{r.text}")
         return False
 
+
 # === Main Auto-Reply Job ===
 def auto_reply_once():
     now = datetime.utcnow()
@@ -101,10 +114,10 @@ def auto_reply_once():
     successes, fails = [], []
 
     for rv in reviews:
-        if rv.get("reviewReply"):  # Skip already replied reviews
+        if rv.get("reviewReply"):  # Skip already replied
             continue
 
-        # Only handle reviews from the last 24 hours
+        # Check if the review is within the last 24 hours
         update_time = rv.get("updateTime") or rv.get("createTime")
         if update_time:
             try:
@@ -123,7 +136,7 @@ def auto_reply_once():
 
         reply = generate_reply(name, stars, text)
         if not reply:
-            fails.append((rid, "No GPT reply"))
+            fails.append((rid, "GPT failed"))
             continue
 
         if post_reply(rid, reply):
@@ -152,12 +165,14 @@ def auto_reply_once():
     send_email(f"🐾 Pawsy Auto-Reply | {len(successes)} sent, {len(fails)} failed", "\n".join(body))
     print("✅ Summary email sent.\n")
 
+
 # === Background Hourly Loop ===
 def loop_hourly():
     while True:
         auto_reply_once()
         print("🕒 Sleeping 1 hour...\n")
         time.sleep(3600)
+
 
 Thread(target=loop_hourly, daemon=True).start()
 
