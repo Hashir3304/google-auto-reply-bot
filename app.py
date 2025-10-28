@@ -6,20 +6,24 @@ from datetime import datetime, timedelta, timezone
 from threading import Thread
 import requests
 from flask import Flask, jsonify
-from openai import OpenAI
+import openai
 
+# === Flask App ===
 app = Flask(__name__)
 
 # === Environment Variables ===
 OPENAI_KEY = os.getenv("OPENAI_KEY")
-GOOGLE_ACCESS_TOKEN = os.getenv("GOOGLE_ACCESS_TOKEN", "").strip()
-ACCOUNT_ID = os.getenv("ACCOUNT_ID")  # Should be: accounts/105711631752015780276
-LOCATION_ID = os.getenv("LOCATION_ID")  # Should be: locations/6993537105495843045
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
+ACCOUNT_ID = os.getenv("ACCOUNT_ID")
+LOCATION_ID = os.getenv("LOCATION_ID")
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO", GMAIL_USER)
 
-client = OpenAI(api_key=OPENAI_KEY)
+openai.api_key = OPENAI_KEY
+
 
 # === Gmail Helper ===
 def send_email(subject, body):
@@ -32,250 +36,209 @@ def send_email(subject, body):
             s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             s.send_message(msg)
         print(f"📧 Email sent: {subject}")
-        return True
     except Exception as e:
         print(f"❌ Email send failed: {e}")
-        return False
 
-@app.route("/")
-def home():
-    return "✅ Pawsy Prints Auto-Reply Bot is live — runs hourly and on-demand via /run-now."
 
-@app.route("/run-now", methods=["GET"])
-def run_now():
-    Thread(target=auto_reply_once).start()
-    return jsonify({"status": "started", "message": "Manual trigger started."})
+# === Google OAuth Manager ===
+class GoogleAuthManager:
+    def __init__(self):
+        self.access_token = None
+        self.token_expiry = datetime.now(timezone.utc)
 
-# === Debug Endpoints ===
-@app.route("/debug-now", methods=["GET"])
-def debug_now():
-    """Check current status and configuration"""
-    config_status = {
-        "account_id": ACCOUNT_ID,
-        "location_id": LOCATION_ID,
-        "account_id_valid": ACCOUNT_ID and ACCOUNT_ID.startswith("accounts/"),
-        "location_id_valid": LOCATION_ID and LOCATION_ID.startswith("locations/"),
-        "google_token_set": bool(GOOGLE_ACCESS_TOKEN),
-        "openai_set": bool(OPENAI_KEY),
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    # Test API connection
-    try:
-        reviews = get_reviews()
-        config_status["api_connection"] = "✅ Working"
-        config_status["reviews_found"] = len(reviews)
-        
-        # Check for pending reviews
-        pending = []
-        for rv in reviews:
-            if not rv.get("reviewReply"):
-                pending.append({
-                    "id": rv.get("reviewId"),
-                    "stars": rv.get("starRating"),
-                    "comment_preview": rv.get("comment", "")[:50] + "..." if rv.get("comment") else "No comment"
-                })
-        
-        config_status["pending_reviews"] = pending
-        config_status["pending_count"] = len(pending)
-        
-    except Exception as e:
-        config_status["api_connection"] = f"❌ Error: {str(e)}"
-    
-    return jsonify(config_status)
+    def refresh_access_token(self):
+        """Refresh Google OAuth2 access token using refresh token"""
+        try:
+            print("🔄 Refreshing Google access token...")
+            url = "https://oauth2.googleapis.com/token"
+            data = {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": GOOGLE_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            }
+            r = requests.post(url, data=data, timeout=30)
+            r.raise_for_status()
+            token_data = r.json()
+            self.access_token = token_data["access_token"]
+            expires_in = token_data.get("expires_in", 3600)
+            self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            print("✅ Google token refreshed successfully")
+        except Exception as e:
+            print(f"❌ Token refresh failed: {e}")
+            send_email("❌ Google Token Refresh Failed", str(e))
 
-# === Fetch Google Reviews ===
-def get_reviews():
-    """Fetch reviews using correct Google My Business API endpoint"""
-    if not ACCOUNT_ID or not ACCOUNT_ID.startswith("accounts/"):
-        error_msg = f"Invalid ACCOUNT_ID: {ACCOUNT_ID}. Should start with 'accounts/'"
-        print(f"❌ {error_msg}")
-        send_email("❌ Configuration Error", error_msg)
-        return []
-    
-    if not LOCATION_ID or not LOCATION_ID.startswith("locations/"):
-        error_msg = f"Invalid LOCATION_ID: {LOCATION_ID}. Should start with 'locations/'"
-        print(f"❌ {error_msg}")
-        send_email("❌ Configuration Error", error_msg)
-        return []
-    
-    url = f"https://mybusiness.googleapis.com/v4/{ACCOUNT_ID}/{LOCATION_ID}/reviews"
-    headers = {"Authorization": f"Bearer {GOOGLE_ACCESS_TOKEN}"}
-    
-    print(f"🔍 Fetching reviews from: {url}")
-    try:
-        r = requests.get(url, headers=headers, timeout=30)
-        if r.status_code != 200:
-            error_msg = f"Google API Error {r.status_code}: {r.text}"
-            print(f"❌ {error_msg}")
-            send_email("❌ Fetch Reviews Failed", error_msg)
-            return []
-        
-        reviews = r.json().get("reviews", [])
-        print(f"✅ Successfully fetched {len(reviews)} reviews")
-        return reviews
-        
-    except Exception as e:
-        error_msg = f"Request failed: {e}"
-        print(f"❌ {error_msg}")
-        send_email("❌ Fetch Reviews Failed", error_msg)
-        return []
+    def get_valid_token(self):
+        """Return valid token (refresh if expired)"""
+        if not self.access_token or datetime.now(timezone.utc) >= self.token_expiry:
+            self.refresh_access_token()
+        return self.access_token
 
-# === Generate AI Reply ===
+
+google_auth = GoogleAuthManager()
+
+
+# === OpenAI Reply Generator ===
 def generate_reply(name, stars, text):
     prompt = (
         f"{name} left a {stars}-star Google review:\n"
         f"\"{text}\"\n\n"
-        "Write a warm, kind, and professional thank-you reply from Pawsy Prints under 60 words."
+        "Write a short, friendly, and professional public reply from Pawsy Prints (under 60 words). "
+        "Be warm and appreciative. If low rating, express understanding and offer help."
     )
     try:
-        print(f"🤖 Generating AI reply for {stars}-star review...")
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are Pawsy Prints' friendly assistant for public customer replies."},
+                {"role": "system", "content": "You write professional customer replies for Pawsy Prints."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=150
         )
-        reply = response.choices[0].message.content.strip()
-        print(f"✅ AI reply generated: {reply[:50]}...")
-        return reply
+        return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"❌ OpenAI error: {e}")
         send_email("❌ GPT Error", str(e))
         return ""
 
-# === Post Reply ===
-def post_reply(review_id, reply):
-    """Post reply using correct Google My Business API endpoint"""
-    if not ACCOUNT_ID or not LOCATION_ID:
-        print("❌ Missing ACCOUNT_ID or LOCATION_ID")
-        return False
-    
-    url = f"https://mybusiness.googleapis.com/v4/{ACCOUNT_ID}/{LOCATION_ID}/reviews/{review_id}/reply"
-    headers = {
-        "Authorization": f"Bearer {GOOGLE_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    
-    print(f"📤 Posting reply to: {url}")
+
+# === Google Review Fetcher ===
+def get_reviews():
+    """Fetch reviews from Google My Business API"""
     try:
+        url = f"https://mybusiness.googleapis.com/v4/accounts/{ACCOUNT_ID}/locations/{LOCATION_ID}/reviews"
+        headers = {"Authorization": f"Bearer {google_auth.get_valid_token()}"}
+        r = requests.get(url, headers=headers, timeout=30)
+
+        if r.status_code == 401:
+            google_auth.refresh_access_token()
+            headers["Authorization"] = f"Bearer {google_auth.get_valid_token()}"
+            r = requests.get(url, headers=headers, timeout=30)
+
+        if r.status_code != 200:
+            send_email("❌ Fetch Reviews Failed", f"Status: {r.status_code}\n\n{r.text}")
+            print(f"❌ Failed to fetch reviews: {r.text}")
+            return []
+        data = r.json()
+        reviews = data.get("reviews", [])
+        print(f"📝 Found {len(reviews)} reviews")
+        return reviews
+    except Exception as e:
+        print(f"❌ Error fetching reviews: {e}")
+        send_email("❌ Fetch Reviews Failed", str(e))
+        return []
+
+
+# === Post Reply to Review ===
+def post_reply(review_id, reply):
+    try:
+        url = f"https://mybusiness.googleapis.com/v4/accounts/{ACCOUNT_ID}/locations/{LOCATION_ID}/reviews/{review_id}/reply"
+        headers = {
+            "Authorization": f"Bearer {google_auth.get_valid_token()}",
+            "Content-Type": "application/json",
+        }
         r = requests.put(url, headers=headers, json={"comment": reply}, timeout=30)
         if r.status_code == 200:
-            print(f"✅ Posted reply for {review_id}")
+            print(f"✅ Posted reply for review {review_id}")
             return True
         else:
-            error_msg = f"Failed to post reply ({r.status_code}): {r.text}"
-            print(f"❌ {error_msg}")
-            send_email("❌ Post Reply Failed", error_msg)
+            send_email("❌ Post Reply Failed", f"Review ID: {review_id}\n\n{r.text}")
+            print(f"❌ Failed to post reply ({r.status_code}): {r.text}")
             return False
     except Exception as e:
-        error_msg = f"Request failed: {e}"
-        print(f"❌ {error_msg}")
-        send_email("❌ Post Reply Failed", error_msg)
+        send_email("❌ Post Reply Failed", f"Error posting reply: {str(e)}")
         return False
 
-# === Main Auto-Reply Job ===
+
+# === Auto Reply Core Logic ===
 def auto_reply_once():
-    print(f"🔄 Starting auto-reply job at {datetime.now()}")
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
     reviews = get_reviews()
-    
-    if not reviews:
-        print("ℹ️ No reviews found.")
-        send_email("🤖 Pawsy Auto-Reply - No Reviews", f"No reviews found.\nCheck time: {now}")
-        return
-
     successes, fails = [], []
 
     for rv in reviews:
         if rv.get("reviewReply"):
-            print(f"⏩ Skipping review {rv.get('reviewId')} - already has reply")
-            continue
+            continue  # skip if already replied
 
-        update_time = rv.get("updateTime") or rv.get("createTime")
-        if update_time:
+        review_time = rv.get("updateTime") or rv.get("createTime")
+        if review_time:
             try:
-                t = datetime.fromisoformat(update_time.replace("Z", "+00:00"))
+                t = datetime.fromisoformat(review_time.replace("Z", "+00:00"))
                 if t < cutoff:
-                    print(f"⏩ Skipping review {rv.get('reviewId')} - older than 24h")
                     continue
-            except Exception:
+            except:
                 pass
 
         rid = rv.get("reviewId")
         name = rv.get("reviewer", {}).get("displayName", "Customer")
         stars = rv.get("starRating", "5")
         text = rv.get("comment", "")
-        if not text:
-            print(f"⏩ Skipping review {rid} - no comment text")
+        if not text.strip():
             continue
 
-        print(f"📨 Processing {stars}-star review from {name}")
         reply = generate_reply(name, stars, text)
         if not reply:
-            fails.append((rid, "GPT failed"))
+            fails.append((rid, "No reply generated"))
             continue
 
         if post_reply(rid, reply):
             successes.append((name, stars, text, reply))
         else:
-            fails.append((rid, "Post failed"))
+            fails.append((rid, "Failed to post"))
 
         time.sleep(2)
 
+    # Summary email
     summary = [
         f"🕓 Run: {now.strftime('%Y-%m-%d %H:%M UTC')}",
         f"✅ Replies sent: {len(successes)}",
         f"❌ Failures: {len(fails)}",
+        f"📝 Total reviews fetched: {len(reviews)}",
         "",
     ]
-    for s in successes:
-        name, stars, text, reply = s
-        summary.append(f"— {name} ({stars}★)\n{text}\n→ {reply}\n")
-    for f in fails:
-        rid, reason = f
+    for name, stars, text, reply in successes:
+        summary.append(f"{name} ({stars}★)\n{text}\n→ {reply}\n")
+    for rid, reason in fails:
         summary.append(f"⚠️ {rid}: {reason}")
 
-    email_sent = send_email(f"🐾 Pawsy Auto-Reply | {len(successes)} sent, {len(fails)} failed", "\n".join(summary))
-    if email_sent:
-        print("✅ Summary email sent.")
-    else:
-        print("❌ Failed to send summary email.")
-    print(f"✅ Auto-reply job completed. Success: {len(successes)}, Failures: {len(fails)}")
+    send_email(f"🐾 Pawsy Auto-Reply Summary ({len(successes)} success, {len(fails)} failed)", "\n".join(summary))
+    print("✅ Auto-reply cycle complete.")
 
+
+# === Background Hourly Loop ===
 def loop_hourly():
-    print("🕒 Starting hourly review check loop...")
+    print("🕒 Starting hourly auto-reply loop...")
     while True:
         try:
             auto_reply_once()
         except Exception as e:
-            print(f"❌ Error in hourly loop: {e}")
-            send_email("❌ Auto-Reply Loop Error", str(e))
-        
-        print("🕒 Sleeping for 1 hour...")
+            print(f"❌ Hourly loop error: {e}")
+            send_email("❌ Hourly Loop Error", str(e))
+        print("💤 Sleeping 1 hour...\n")
         time.sleep(3600)
 
-# Start background thread
-def start_background_thread():
-    try:
-        thread = Thread(target=loop_hourly, daemon=True)
-        thread.start()
-        print(f"✅ Background thread started: {thread.name}")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to start background thread: {e}")
-        return False
 
-print("🚀 Starting Pawsy Prints Auto-Reply Bot...")
-if start_background_thread():
-    print("✅ Background thread started successfully")
-else:
-    print("❌ Failed to start background thread")
+# === Flask Routes ===
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "✅ Pawsy Prints Auto-Reply Bot is live",
+        "manual_trigger": "/run-now",
+        "schedule": "Runs hourly in background",
+    })
+
+
+@app.route("/run-now", methods=["GET"])
+def run_now():
+    Thread(target=auto_reply_once).start()
+    return jsonify({"status": "started", "message": "Manual trigger started."})
+
+
+# === Run Application ===
+Thread(target=loop_hourly, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Starting Pawsy Prints Auto-Reply Bot on port {port}")
     app.run(host="0.0.0.0", port=port)
