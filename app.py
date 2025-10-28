@@ -2,24 +2,23 @@ import os
 import time
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Thread
 import requests
-import openai
 from flask import Flask, jsonify
+from openai import OpenAI
 
 app = Flask(__name__)
 
 # === Environment Variables ===
 OPENAI_KEY = os.getenv("OPENAI_KEY")
-GOOGLE_ACCESS_TOKEN = os.getenv("GOOGLE_ACCESS_TOKEN")
+GOOGLE_ACCESS_TOKEN = os.getenv("GOOGLE_ACCESS_TOKEN", "").strip()  # ← Strip newline
 PLACE_ID = os.getenv("PLACE_ID")
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO", GMAIL_USER)
 
-# === Configure OpenAI (stable version) ===
-openai.api_key = OPENAI_KEY
+client = OpenAI(api_key=OPENAI_KEY)
 
 
 # === Gmail Helper ===
@@ -37,17 +36,15 @@ def send_email(subject, body):
         print(f"❌ Email send failed: {e}")
 
 
-# === Health Check Route ===
 @app.route("/")
 def home():
     return "✅ Pawsy Prints Auto-Reply Bot is live — runs hourly and on-demand via /run-now."
 
 
-# === Manual Trigger Route ===
 @app.route("/run-now", methods=["GET"])
 def run_now():
     Thread(target=auto_reply_once).start()
-    return jsonify({"status": "started", "message": "Auto-reply process triggered manually."})
+    return jsonify({"status": "started", "message": "Manual trigger started."})
 
 
 # === Fetch Google Reviews ===
@@ -70,7 +67,7 @@ def generate_reply(name, stars, text):
         "Write a warm, kind, and professional thank-you reply from Pawsy Prints under 60 words."
     )
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are Pawsy Prints’ friendly assistant for public customer replies."},
@@ -78,14 +75,14 @@ def generate_reply(name, stars, text):
             ],
             temperature=0.7,
         )
-        return response["choices"][0]["message"]["content"].strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"❌ OpenAI error: {e}")
         send_email("❌ GPT Error", str(e))
         return ""
 
 
-# === Post Reply to Google ===
+# === Post Reply ===
 def post_reply(review_id, reply):
     url = f"https://mybusiness.googleapis.com/v4/accounts/{PLACE_ID}/locations/reviews/{review_id}/reply"
     headers = {
@@ -104,7 +101,7 @@ def post_reply(review_id, reply):
 
 # === Main Auto-Reply Job ===
 def auto_reply_once():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
     reviews = get_reviews()
     if not reviews:
@@ -114,10 +111,9 @@ def auto_reply_once():
     successes, fails = [], []
 
     for rv in reviews:
-        if rv.get("reviewReply"):  # Skip already replied
+        if rv.get("reviewReply"):
             continue
 
-        # Check if the review is within the last 24 hours
         update_time = rv.get("updateTime") or rv.get("createTime")
         if update_time:
             try:
@@ -146,27 +142,23 @@ def auto_reply_once():
 
         time.sleep(2)
 
-    # === Summary Email ===
-    total = len(reviews)
-    body = [
+    summary = [
         f"🕓 Run: {now.strftime('%Y-%m-%d %H:%M UTC')}",
-        f"📊 Total reviews fetched: {total}",
         f"✅ Replies sent: {len(successes)}",
         f"❌ Failures: {len(fails)}",
         "",
     ]
     for s in successes:
         name, stars, text, reply = s
-        body.append(f"— {name} ({stars}★)\n{text}\n→ {reply}\n")
+        summary.append(f"— {name} ({stars}★)\n{text}\n→ {reply}\n")
     for f in fails:
         rid, reason = f
-        body.append(f"⚠️ {rid}: {reason}")
+        summary.append(f"⚠️ {rid}: {reason}")
 
-    send_email(f"🐾 Pawsy Auto-Reply | {len(successes)} sent, {len(fails)} failed", "\n".join(body))
+    send_email(f"🐾 Pawsy Auto-Reply | {len(successes)} sent, {len(fails)} failed", "\n".join(summary))
     print("✅ Summary email sent.\n")
 
 
-# === Background Hourly Loop ===
 def loop_hourly():
     while True:
         auto_reply_once()
@@ -179,3 +171,4 @@ Thread(target=loop_hourly, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
