@@ -187,13 +187,11 @@ def run_now():
 def healthz():
     try:
         token_expiry = google_auth.expiry.isoformat() if google_auth.expiry else "unknown"
-        # Quick Gemini ping
-        test_prompt = "Say hi from Gemini API"
         ping = requests.post(
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
             headers={"Content-Type": "application/json"},
             params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": test_prompt}]}]},
+            json={"contents": [{"parts": [{"text": "Say hi"}]}]},
             timeout=10,
         )
         status = "healthy" if ping.status_code == 200 else "Gemini issue"
