@@ -191,7 +191,8 @@ def run_now():
 @app.route("/healthz")
 def healthz():
     try:
-        gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+        gemini_url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent"
+
         ping = requests.post(
             gemini_url,
             headers={"Content-Type": "application/json"},
