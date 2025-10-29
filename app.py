@@ -93,12 +93,13 @@ def generate_reply(name, stars, text):
         "If the rating is low, be professional and understanding."
     )
     try:
+        # ✅ Correct AI Studio Gemini endpoint
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
         res = requests.post(
             url,
             headers={"Content-Type": "application/json"},
             params={"key": GEMINI_API_KEY},
-            json={"contents":[{"parts":[{"text":prompt}]}]},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=20
         )
         res.raise_for_status()
@@ -110,6 +111,7 @@ def generate_reply(name, stars, text):
         print(f"❌ Gemini API error: {e}")
         send_email("❌ Gemini API Error", str(e))
         return ""
+
 
 # === Post reply ===
 def post_reply(account_id, location_id, review_id, reply):
