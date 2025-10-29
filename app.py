@@ -100,17 +100,20 @@ def generate_reply(name, stars, text):
             params={"key": GEMINI_API_KEY},
             json={
                 "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": prompt}]
-                    }
+                    {"role": "user", "parts": [{"text": prompt}]}
                 ]
             },
             timeout=20
         )
         res.raise_for_status()
         data = res.json()
-        reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        reply = (
+            data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+        )
         print(f"🤖 Generated reply: {reply[:60]}...")
         return reply
     except Exception as e:
@@ -144,12 +147,14 @@ def auto_reply_once():
 
     successes, fails = [], []
     for rv in reviews:
-        if rv.get("reviewReply"): continue
+        if rv.get("reviewReply"): 
+            continue
         rid = rv["reviewId"]
         name = rv.get("reviewer", {}).get("displayName", "Customer")
         stars = rv.get("starRating", "5")
         text  = rv.get("comment", "")
-        if not text.strip(): continue
+        if not text.strip(): 
+            continue
         reply = generate_reply(name, stars, text)
         if reply and post_reply(account_id, location_id, rid, reply):
             successes.append(name)
