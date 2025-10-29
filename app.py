@@ -10,7 +10,7 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # === Environment Variables ===
-GEMINI_API_KEY = os.getenv("PawsyBotKey")  # your Gemini API key
+GEMINI_API_KEY = os.getenv("PawsyBotKey")           # your Gemini API key
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
@@ -101,8 +101,10 @@ def generate_reply(name, stars, text):
         "If the rating is low, be understanding and professional."
     )
     try:
+        # Correct Generative Language endpoint
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
         res = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
+            url,
             headers={"Content-Type": "application/json"},
             params={"key": GEMINI_API_KEY},
             json={"contents": [{"parts": [{"text": prompt}]}]},
@@ -191,14 +193,14 @@ def healthz():
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
             headers={"Content-Type": "application/json"},
             params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": "Say hi"}]}]},
+            json={"contents": [{"parts": [{"text": "ping"}]}]},
             timeout=10,
         )
         status = "healthy" if ping.status_code == 200 else "Gemini issue"
         return jsonify({
             "status": status,
-            "google_token_expiry": token_expiry,
             "gemini_status": ping.status_code,
+            "google_token_expiry": token_expiry,
             "uptime": str(datetime.now(timezone.utc))
         }), 200
     except Exception as e:
