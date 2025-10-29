@@ -1,30 +1,25 @@
-import os
-import time
-import smtplib
+import os, time, smtplib, requests
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from threading import Thread
-import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# === Environment Variables ===
-GEMINI_API_KEY = os.getenv("PawsyBotKey")           # your Gemini API key
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+# === Environment ===
+GEMINI_API_KEY       = os.getenv("PawsyBotKey")
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
-GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO", GMAIL_USER)
+GMAIL_USER           = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD   = os.getenv("GMAIL_APP_PASSWORD")
+NOTIFY_EMAIL_TO      = os.getenv("NOTIFY_EMAIL_TO", GMAIL_USER)
 
-# === Gmail Helper ===
+# === Gmail helper ===
 def send_email(subject, body):
     try:
         msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = GMAIL_USER
-        msg["To"] = NOTIFY_EMAIL_TO
+        msg["Subject"], msg["From"], msg["To"] = subject, GMAIL_USER, NOTIFY_EMAIL_TO
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             s.send_message(msg)
@@ -32,15 +27,13 @@ def send_email(subject, body):
     except Exception as e:
         print(f"❌ Email send failed: {e}")
 
-# === Token Manager ===
+# === Google OAuth ===
 class GoogleAuth:
     def __init__(self):
-        self.access_token = None
-        self.expiry = None
+        self.access_token, self.expiry = None, None
 
     def refresh_token(self):
         print("🔄 Refreshing Google access token...")
-        url = "https://oauth2.googleapis.com/token"
         data = {
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
@@ -48,7 +41,7 @@ class GoogleAuth:
             "grant_type": "refresh_token",
         }
         try:
-            r = requests.post(url, data=data, timeout=20)
+            r = requests.post("https://oauth2.googleapis.com/token", data=data, timeout=20)
             r.raise_for_status()
             j = r.json()
             self.access_token = j["access_token"]
@@ -65,93 +58,91 @@ class GoogleAuth:
 
 google_auth = GoogleAuth()
 
-# === Google API Helpers ===
+# === Google Business helpers ===
 def get_account_and_location():
     token = google_auth.get_token()
     headers = {"Authorization": f"Bearer {token}"}
-    acc_url = "https://mybusinessaccountmanagement.googleapis.com/v1/accounts"
-    acc_resp = requests.get(acc_url, headers=headers)
-    acc_resp.raise_for_status()
-    account_id = acc_resp.json()["accounts"][0]["name"].split("/")[-1]
+    acc = requests.get("https://mybusinessaccountmanagement.googleapis.com/v1/accounts", headers=headers)
+    acc.raise_for_status()
+    account_id = acc.json()["accounts"][0]["name"].split("/")[-1]
 
     loc_url = f"https://mybusinessbusinessinformation.googleapis.com/v1/accounts/{account_id}/locations?readMask=name,title,websiteUri"
-    loc_resp = requests.get(loc_url, headers=headers)
-    loc_resp.raise_for_status()
-    location_id = loc_resp.json()["locations"][0]["name"].split("/")[-1]
+    loc = requests.get(loc_url, headers=headers)
+    loc.raise_for_status()
+    location_id = loc.json()["locations"][0]["name"].split("/")[-1]
     return account_id, location_id
 
-# === Review Fetch ===
 def get_reviews(account_id, location_id):
     token = google_auth.get_token()
-    url = f"https://mybusiness.googleapis.com/v4/accounts/{account_id}/locations/{location_id}/reviews"
     headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(url, headers=headers)
+    r = requests.get(
+        f"https://mybusiness.googleapis.com/v4/accounts/{account_id}/locations/{location_id}/reviews",
+        headers=headers, timeout=20)
     if r.status_code != 200:
-        print(f"❌ Failed to fetch reviews: {r.text}")
         send_email("❌ Fetch Reviews Failed", r.text)
+        print(f"❌ Failed to fetch reviews: {r.text}")
         return []
     return r.json().get("reviews", [])
 
-# === Gemini Reply Generator ===
+# === Gemini reply ===
 def generate_reply(name, stars, text):
     prompt = (
         f"{name} left a {stars}-star Google review:\n"
         f"\"{text}\"\n\n"
-        "Write a warm, concise, and kind reply (under 60 words) from Pawsy Prints. "
-        "If the rating is low, be understanding and professional."
+        "Write a warm, concise, kind reply (under 60 words) from Pawsy Prints. "
+        "If the rating is low, be professional and understanding."
     )
     try:
-        # Correct Generative Language endpoint
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
         res = requests.post(
             url,
             headers={"Content-Type": "application/json"},
             params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
+            json={"contents":[{"parts":[{"text":prompt}]}]},
+            timeout=20
         )
         res.raise_for_status()
         data = res.json()
         reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        print(f"🤖 Generated reply: {reply[:60]}...")
         return reply
     except Exception as e:
         print(f"❌ Gemini API error: {e}")
         send_email("❌ Gemini API Error", str(e))
         return ""
 
-# === Post Reply ===
+# === Post reply ===
 def post_reply(account_id, location_id, review_id, reply):
     token = google_auth.get_token()
-    url = f"https://mybusiness.googleapis.com/v4/accounts/{account_id}/locations/{location_id}/reviews/{review_id}/reply"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    r = requests.put(url, headers=headers, json={"comment": reply})
+    r = requests.put(
+        f"https://mybusiness.googleapis.com/v4/accounts/{account_id}/locations/{location_id}/reviews/{review_id}/reply",
+        headers=headers, json={"comment": reply})
     if r.status_code == 200:
         print(f"✅ Posted reply for review {review_id}")
         return True
     print(f"❌ Failed to post reply: {r.text}")
     return False
 
-# === Main Logic ===
+# === Core job ===
 def auto_reply_once():
     print(f"🔄 Auto-reply job started at {datetime.now(timezone.utc)}")
     try:
         account_id, location_id = get_account_and_location()
         reviews = get_reviews(account_id, location_id)
     except Exception as e:
-        print(f"❌ Setup failed: {e}")
         send_email("❌ Setup Failed", str(e))
+        print(f"❌ Setup failed: {e}")
         return
 
     successes, fails = [], []
     for rv in reviews:
-        if rv.get("reviewReply"):
-            continue
+        if rv.get("reviewReply"): continue
         rid = rv["reviewId"]
         name = rv.get("reviewer", {}).get("displayName", "Customer")
         stars = rv.get("starRating", "5")
-        text = rv.get("comment", "")
-        if not text.strip():
-            continue
+        text  = rv.get("comment", "")
+        if not text.strip(): continue
         reply = generate_reply(name, stars, text)
         if reply and post_reply(account_id, location_id, rid, reply):
             successes.append(name)
@@ -163,14 +154,14 @@ def auto_reply_once():
     print(summary)
     send_email("🐾 Pawsy Auto-Reply Summary", summary)
 
-# === Background Loop ===
+# === Background loop ===
 def loop_hourly():
     print("🕒 Starting hourly auto-reply loop...")
     while True:
         auto_reply_once()
         time.sleep(3600)
 
-# === Flask Endpoints ===
+# === Routes ===
 @app.route("/")
 def home():
     return jsonify({
@@ -188,27 +179,29 @@ def run_now():
 @app.route("/healthz")
 def healthz():
     try:
-        token_expiry = google_auth.expiry.isoformat() if google_auth.expiry else "unknown"
+        gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
         ping = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
-            headers={"Content-Type": "application/json"},
+            gemini_url,
+            headers={"Content-Type":"application/json"},
             params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": "ping"}]}]},
-            timeout=10,
+            json={"contents":[{"parts":[{"text":"ping"}]}]},
+            timeout=15
         )
-        status = "healthy" if ping.status_code == 200 else "Gemini issue"
+        gemini_status = ping.status_code
+        google_token_expiry = google_auth.expiry.isoformat() if google_auth.expiry else "unknown"
         return jsonify({
-            "status": status,
-            "gemini_status": ping.status_code,
-            "google_token_expiry": token_expiry,
-            "uptime": str(datetime.now(timezone.utc))
-        }), 200
+            "status":"healthy" if gemini_status==200 else "Gemini issue",
+            "gemini_status":gemini_status,
+            "google_token_expiry":google_token_expiry,
+            "uptime":datetime.now(timezone.utc).isoformat()
+        }),200
     except Exception as e:
-        return jsonify({"status": "error", "detail": str(e)}), 500
+        return jsonify({"status":"error","detail":str(e)}),500
 
+# === Start loops ===
 Thread(target=loop_hourly, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port=int(os.environ.get("PORT",10000))
     print(f"🚀 Starting Pawsy Prints Gemini Auto-Reply Bot on port {port}")
     app.run(host="0.0.0.0", port=port)
