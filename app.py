@@ -84,7 +84,7 @@ def get_reviews(account_id, location_id):
         return []
     return r.json().get("reviews", [])
 
-# === Gemini Reply Generator ===
+# === Gemini (Vertex AI) Reply Generator ===
 def generate_reply(name, stars, text):
     prompt = (
         f"{name} left a {stars}-star Google review:\n"
@@ -93,33 +93,24 @@ def generate_reply(name, stars, text):
         "If the rating is low, be professional and understanding."
     )
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta1/models/gemini-1.5-flash-latest:generateContent"
-
+        url = "https://us-central1-aiplatform.googleapis.com/v1/projects/pawsyprints-ai-autoreply/locations/us-central1/publishers/google/models/gemini-1.5-flash:predict"
         res = requests.post(
             url,
-            headers={"Content-Type": "application/json"},
-            params={"key": GEMINI_API_KEY},
-            json={
-                "contents": [
-                    {"role": "user", "parts": [{"text": prompt}]}
-                ]
+            headers={
+                "Authorization": f"Bearer {google_auth.get_token()}",
+                "Content-Type": "application/json"
             },
+            json={"instances": [{"prompt": prompt}]},
             timeout=20
         )
         res.raise_for_status()
         data = res.json()
-        reply = (
-            data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-                .strip()
-        )
+        reply = data.get("predictions", [{}])[0].get("content", "").strip()
         print(f"🤖 Generated reply: {reply[:60]}...")
         return reply
     except Exception as e:
-        print(f"❌ Gemini API error: {e}")
-        send_email("❌ Gemini API Error", str(e))
+        print(f"❌ Gemini Vertex error: {e}")
+        send_email("❌ Gemini Vertex Error", str(e))
         return ""
 
 # === Post Reply to Google ===
@@ -148,13 +139,13 @@ def auto_reply_once():
 
     successes, fails = [], []
     for rv in reviews:
-        if rv.get("reviewReply"): 
+        if rv.get("reviewReply"):
             continue
         rid = rv["reviewId"]
         name = rv.get("reviewer", {}).get("displayName", "Customer")
         stars = rv.get("starRating", "5")
         text  = rv.get("comment", "")
-        if not text.strip(): 
+        if not text.strip():
             continue
         reply = generate_reply(name, stars, text)
         if reply and post_reply(account_id, location_id, rid, reply):
@@ -178,7 +169,7 @@ def loop_hourly():
 @app.route("/")
 def home():
     return jsonify({
-        "status": "✅ Pawsy Prints Gemini Auto-Reply Bot is live",
+        "status": "✅ Pawsy Prints Gemini Auto-Reply Bot (Vertex AI)",
         "manual_trigger": "/run-now",
         "health": "/healthz",
         "schedule": "Runs hourly in background"
@@ -192,17 +183,12 @@ def run_now():
 @app.route("/healthz")
 def healthz():
     try:
-        gemini_url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent"
-
+        url = "https://us-central1-aiplatform.googleapis.com/v1/projects/pawsyprints-ai-autoreply/locations/us-central1/publishers/google/models/gemini-1.5-flash:predict"
         ping = requests.post(
-            gemini_url,
-            headers={"Content-Type": "application/json"},
-            params={"key": GEMINI_API_KEY},
-            json={
-                "contents": [
-                    {"role": "user", "parts": [{"text": "ping"}]}
-                ]
-            },
+            url,
+            headers={"Authorization": f"Bearer {google_auth.get_token()}",
+                     "Content-Type": "application/json"},
+            json={"instances": [{"prompt": "ping"}]},
             timeout=10
         )
         gemini_status = ping.status_code
@@ -220,5 +206,5 @@ Thread(target=loop_hourly, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Starting Pawsy Prints Gemini Auto-Reply Bot on port {port}")
+    print(f"🚀 Starting Pawsy Prints Gemini Vertex Auto-Reply Bot on port {port}")
     app.run(host="0.0.0.0", port=port)
