@@ -93,7 +93,8 @@ def generate_reply(name, stars, text):
         "If the rating is low, be professional and understanding."
     )
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta1/models/gemini-1.5-flash-latest:generateContent"
+
         res = requests.post(
             url,
             headers={"Content-Type": "application/json"},
